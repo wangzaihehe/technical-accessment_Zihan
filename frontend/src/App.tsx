@@ -134,7 +134,7 @@ function App() {
                 type="text"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
-                placeholder="Enter website URL, e.g., https://example.com/login"
+                placeholder="Enter website URL, e.g., https://example.com"
                 className="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none"
                 disabled={loading}
               />

@@ -6,17 +6,7 @@ import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import asyncio
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
-import os
-
-# Global browser driver (will be initialized on demand)
-_driver: Optional[webdriver.Chrome] = None
+from playwright.async_api import async_playwright, Browser, Page
 
 app = FastAPI(title="Website Authentication Component Detector API")
 
@@ -29,234 +19,178 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_browser_driver():
-    """Get or create a Chrome browser driver"""
-    global _driver
-    if _driver is None:
-        try:
-            chrome_options = Options()
-            chrome_options.add_argument('--headless=new')  # Use new headless mode
-            chrome_options.add_argument('--no-sandbox')
-            chrome_options.add_argument('--disable-dev-shm-usage')
-            chrome_options.add_argument('--disable-gpu')
-            chrome_options.add_argument('--window-size=1920,1080')
-            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-            chrome_options.add_argument('--disable-web-security')
-            chrome_options.add_argument('--allow-running-insecure-content')
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
-            chrome_options.add_experimental_option('useAutomationExtension', False)
-            chrome_options.add_experimental_option("detach", True)
-            chrome_options.add_argument('user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-            
-            # Add additional options to avoid detection
-            prefs = {
-                "profile.default_content_setting_values": {
-                    "notifications": 2
-                },
-                "profile.managed_default_content_settings": {
-                    "images": 1
-                }
-            }
-            chrome_options.add_experimental_option("prefs", prefs)
-            
-            # Get the correct chromedriver path
-            base_path = ChromeDriverManager().install()
-            # webdriver-manager sometimes returns wrong file, search for actual chromedriver
-            import os
-            import glob
-            import subprocess
-            
-            # Search in the directory containing the returned path
-            search_dir = os.path.dirname(base_path) if os.path.isfile(base_path) else base_path
-            if not os.path.isdir(search_dir):
-                search_dir = os.path.dirname(search_dir)
-            
-            # Find the actual chromedriver executable
-            driver_path = None
-            
-            # Try common paths
-            common_paths = [
-                os.path.join(search_dir, 'chromedriver'),
-                os.path.join(search_dir, 'chromedriver-mac-arm64', 'chromedriver'),
-                os.path.join(search_dir, 'chromedriver-mac-x64', 'chromedriver'),
-            ]
-            
-            for path in common_paths:
-                if os.path.isfile(path):
-                    driver_path = path
-                    break
-            
-            # Fallback: manual search
-            if not driver_path:
-                for root, dirs, files in os.walk(search_dir):
-                    for file in files:
-                        if file == 'chromedriver' and not file.endswith('.txt') and not file.endswith('.md'):
-                            full_path = os.path.join(root, file)
-                            if os.path.isfile(full_path):
-                                driver_path = full_path
-                                break
-                    if driver_path:
-                        break
-            
-            if not driver_path or not os.path.isfile(driver_path):
-                raise Exception(f"Could not find chromedriver executable in {search_dir}. Tried: {common_paths}")
-            
-            service = Service(driver_path)
-            _driver = webdriver.Chrome(service=service, options=chrome_options)
-        except Exception as e:
-            print(f"Warning: Could not initialize Chrome browser: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-    return _driver
+# Global Playwright browser instance
+_playwright = None
+_browser: Optional[Browser] = None
 
-def scrape_with_browser_sync(url: str) -> Optional[str]:
-    """Scrape website using Selenium browser for JavaScript-rendered content"""
-    import time
-    driver = get_browser_driver()
-    if not driver:
+@app.on_event("startup")
+async def startup_event():
+    """Initialize Playwright browser on startup"""
+    global _playwright, _browser
+    try:
+        _playwright = await async_playwright().start()
+        _browser = await _playwright.chromium.launch(headless=True)
+    except Exception as e:
+        print(f"Warning: Could not initialize Playwright browser: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close Playwright browser on shutdown"""
+    global _browser, _playwright
+    if _browser:
+        await _browser.close()
+    if _playwright:
+        await _playwright.stop()
+
+def is_login_url(url: str) -> bool:
+    """Check if URL appears to be a login/signin page"""
+    url_lower = url.lower()
+    login_keywords = ['login', 'signin', 'sign-in', 'sign_in', 'auth', 'authenticate', 'log-in']
+    return any(keyword in url_lower for keyword in login_keywords)
+
+async def find_and_click_login_link(page: Page, base_url: str) -> bool:
+    """Find and click login/signin link on the current page"""
+    try:
+        # Common selectors for login links
+        login_selectors = [
+            'a[href*="login"]',
+            'a[href*="signin"]',
+            'a[href*="sign-in"]',
+            'a[href*="auth"]',
+            'a:has-text("Sign in")',
+            'a:has-text("Sign In")',
+            'a:has-text("Login")',
+            'a:has-text("Log in")',
+            'a:has-text("Log In")',
+            'button:has-text("Sign in")',
+            'button:has-text("Login")',
+        ]
+        
+        # Domain-specific selectors
+        domain = base_url.lower()
+        if 'amazon.com' in domain:
+            login_selectors.extend([
+                '#nav-link-accountList',
+                'a[href*="ap/signin"]',
+            ])
+        elif 'github.com' in domain:
+            login_selectors.extend([
+                'a[href="/login"]',
+            ])
+        elif 'linkedin.com' in domain:
+            login_selectors.extend([
+                'a[href*="/login"]',
+            ])
+        
+        for selector in login_selectors:
+            try:
+                element = await page.query_selector(selector)
+                if element:
+                    # Check if element is visible
+                    is_visible = await element.is_visible()
+                    if is_visible:
+                        print(f"Found login link with selector: {selector}")
+                        await element.click()
+                        await asyncio.sleep(2)  # Wait for navigation
+                        return True
+            except:
+                continue
+        
+        return False
+    except Exception as e:
+        print(f"Error finding login link: {e}")
+        return False
+
+async def scrape_with_playwright(url: str) -> Optional[str]:
+    """Scrape website using Playwright for JavaScript-rendered content"""
+    global _browser
+    if not _browser:
         return None
     
     try:
-        # Execute script to hide webdriver property
-        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-            'source': '''
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5]
-                });
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en']
-                });
-            '''
-        })
-        
-        # For Amazon, visit homepage first and try to navigate to sign-in naturally
-        if 'amazon.com' in url.lower():
-            try:
-                driver.get('https://www.amazon.com')
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "body"))
-                )
-                time.sleep(3)  # Wait for cookies/session and JavaScript to render
-                
-                # Try to find and click "Sign in" link on homepage (multiple strategies)
-                sign_in_clicked = False
-                try:
-                    # Strategy 1: Find by link text
-                    sign_in_links = driver.find_elements(By.PARTIAL_LINK_TEXT, "Sign in")
-                    if not sign_in_links:
-                        sign_in_links = driver.find_elements(By.PARTIAL_LINK_TEXT, "Sign In")
-                    if not sign_in_links:
-                        # Strategy 2: Find by CSS selector
-                        sign_in_links = driver.find_elements(By.CSS_SELECTOR, "a[href*='signin'], a[href*='ap/signin'], a[data-nav-role='signin']")
-                    if not sign_in_links:
-                        # Strategy 3: Find by ID
-                        sign_in_links = driver.find_elements(By.ID, "nav-link-accountList")
-                    
-                    if sign_in_links:
-                        print("Found sign-in link on homepage, clicking...")
-                        # Scroll to element and click
-                        driver.execute_script("arguments[0].scrollIntoView(true);", sign_in_links[0])
-                        time.sleep(0.5)
-                        sign_in_links[0].click()
-                        time.sleep(5)  # Wait for navigation and page load
-                        # Update current URL
-                        current_url = driver.current_url
-                        print(f"Navigated to: {current_url}")
-                        sign_in_clicked = True
-                except Exception as e:
-                    print(f"Could not click sign-in link: {e}")
-                    # Fall back to direct URL access
-                    pass
-                
-                # If clicking didn't work or we want to use direct URL, navigate directly
-                if not sign_in_clicked:
-                    driver.get(url)
-                    time.sleep(2)
-            except:
-                # If homepage visit fails, just go to the URL directly
-                driver.get(url)
-                time.sleep(2)
-        
-        driver.get(url)
-        # Wait for page to load and any dynamic content
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        context = await _browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            locale='en-US'
         )
+        page = await context.new_page()
         
-        # Check current URL (may have redirected)
-        current_url = driver.current_url
+        # Parse URL to get base domain
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        base_domain = f"{parsed.scheme}://{parsed.netloc}"
         
-        # For Amazon, check if page is error/redirect page and wait for actual login page
-        if 'amazon.com' in url.lower():
-            html_preview = driver.page_source
-            html_lower = html_preview.lower()
-            
-            # If page is short, contains error, or seems like redirect, wait for actual page to load
-            if len(html_preview) < 5000 or 'error' in html_lower or 'login' in html_lower:
-                print(f"Detected potential error/redirect page (length: {len(html_preview)}), waiting for actual login page...")
-                initial_url = current_url
-                initial_html_len = len(html_preview)
+        # Check if URL is already a login page
+        is_login = is_login_url(url)
+        
+        if not is_login:
+            # Step 1: Visit homepage first
+            print(f"URL doesn't appear to be a login page, visiting homepage: {base_domain}")
+            try:
+                await page.goto(base_domain, wait_until='domcontentloaded', timeout=15000)
+                await asyncio.sleep(2)  # Wait for page to load
                 
-                # Wait for URL to change or page content to change significantly
-                for i in range(15):  # Wait up to 15 seconds
-                    time.sleep(1)
-                    current_url = driver.current_url
-                    html_check = driver.page_source
-                    html_check_lower = html_check.lower()
+                # Step 2: Try to find and click login link
+                print("Searching for login link on homepage...")
+                login_clicked = await find_and_click_login_link(page, base_domain)
+                
+                if not login_clicked:
+                    # If couldn't find login link, try common login URLs
+                    print("Could not find login link, trying common login URLs...")
+                    common_login_paths = ['/login', '/signin', '/sign-in', '/auth/login']
+                    for path in common_login_paths:
+                        try:
+                            login_url = f"{base_domain}{path}"
+                            await page.goto(login_url, wait_until='domcontentloaded', timeout=15000)
+                            await asyncio.sleep(2)
+                            # Check if we're on a login page now
+                            html_check = await page.content()
+                            if 'password' in html_check.lower() or 'login' in html_check.lower():
+                                print(f"Successfully navigated to login page: {login_url}")
+                                break
+                        except:
+                            continue
+            except Exception as e:
+                print(f"Error visiting homepage: {e}, trying original URL...")
+                await page.goto(url, wait_until='domcontentloaded', timeout=20000)
+        else:
+            # URL is already a login page, but for some sites (like Amazon) we still need to visit homepage first
+            if 'amazon.com' in base_domain.lower():
+                try:
+                    print("Visiting Amazon homepage to establish session...")
+                    await page.goto('https://www.amazon.com', wait_until='domcontentloaded', timeout=15000)
+                    await asyncio.sleep(2)  # Wait for cookies/session
                     
-                    # Check if page content changed significantly (likely loaded actual page)
-                    if (len(html_check) > 10000 and len(html_check) > initial_html_len * 2) or \
-                       (len(html_check) > 5000 and 'password' in html_check_lower and 'input' in html_check_lower):
-                        print(f"Page loaded successfully. URL: {current_url}, HTML length: {len(html_check)}")
-                        break
-                    # Also check if URL changed
-                    if current_url != initial_url and 'signin' in current_url.lower():
-                        print(f"URL changed to: {current_url}")
-                        time.sleep(2)  # Wait a bit more after URL change
-                        break
-                
-                # Additional wait for JavaScript to render after page loads
-                time.sleep(3)
+                    # Then navigate to signin
+                    login_clicked = await find_and_click_login_link(page, base_domain)
+                    if not login_clicked:
+                        await page.goto(url, wait_until='domcontentloaded', timeout=20000)
+                except:
+                    await page.goto(url, wait_until='domcontentloaded', timeout=20000)
+            else:
+                # Direct navigation to login URL
+                await page.goto(url, wait_until='domcontentloaded', timeout=20000)
         
-        # Additional wait for JavaScript to render (longer for complex sites like Amazon)
-        time.sleep(5)
+        # Wait for page to fully load and JavaScript to execute
+        await asyncio.sleep(3)
         
-        # Try to wait for input fields to appear (for login pages)
+        # Try to wait for login form elements to appear
         try:
-            WebDriverWait(driver, 10).until(
-                EC.any_of(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='password']")),
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email']")),
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text']")),
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "input[name*='email']")),
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "input[id*='email']")),
-                )
-            )
-            time.sleep(2)  # Additional wait after inputs appear
+            await page.wait_for_selector('input[type="password"], input[type="email"], input[name*="email"], input[name*="user"], input[id*="email"]', timeout=8000)
+            await asyncio.sleep(1)  # Additional wait after elements appear
         except:
-            pass  # Continue even if inputs don't appear
+            # Even if selector doesn't appear, continue to get HTML
+            pass
         
         # Get the rendered HTML
-        html = driver.page_source
+        html = await page.content()
         
-        # If HTML is too short, might be an error page or redirect
-        if len(html) < 1000:
-            print(f"Warning: HTML is very short ({len(html)} chars), page might not have loaded correctly")
-        
+        await context.close()
         return html
     except Exception as e:
-        print(f"Browser scraping error for {url}: {e}")
+        print(f"Playwright scraping error for {url}: {e}")
         return None
 
-async def scrape_with_browser(url: str) -> Optional[str]:
-    """Async wrapper for browser scraping"""
-    # Run in thread pool to avoid blocking
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, scrape_with_browser_sync, url)
 
 class ScrapeRequest(BaseModel):
     url: Optional[str] = None
@@ -468,7 +402,7 @@ async def scrape_website(url: str) -> ScrapeResult:
             )
         
         # First, try static HTTP method (faster)
-        # Enhanced headers to mimic real browser and bypass anti-bot measures
+        # Enhanced headers to mimic real browser
         headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -484,103 +418,96 @@ async def scrape_website(url: str) -> ScrapeResult:
             'Cache-Control': 'max-age=0',
         }
         
+        html = None
+        static_success = False
+        needs_playwright = False
+        
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             try:
                 response = await client.get(url, headers=headers)
                 
                 # Accept 200 and redirect status codes
-                if response.status_code not in [200, 301, 302, 303, 307, 308]:
-                    # If HTTP fails, try browser
-                    print(f"HTTP request failed with status {response.status_code}, trying browser...")
-                    html = await scrape_with_browser(url)
-                    if html and len(html) > 500:
+                if response.status_code in [200, 301, 302, 303, 307, 308]:
+                    html = response.text
+                    static_success = True
+                    
+                    # Check if we got meaningful content
+                    if len(html) > 500:
+                        # Detect authentication components from static HTML
                         auth_component = detect_auth_components(html, url)
-                        return ScrapeResult(
-                            url=url,
-                            success=True,
-                            authComponent=auth_component
+                        
+                        # If found authentication component, return success
+                        if auth_component.found:
+                            return ScrapeResult(
+                                url=url,
+                                success=True,
+                                authComponent=auth_component
+                            )
+                        
+                        # If static method worked but no auth found, check if we need to use Playwright
+                        html_lower = html.lower()
+                        needs_playwright = (
+                            len(html) < 1000 or
+                            'captcha' in html_lower or
+                            ('robot' in html_lower and 'detected' in html_lower) or
+                            'access denied' in html_lower or
+                            'please enable javascript' in html_lower or
+                            ('amazon.com' in url.lower() and 'ap_error' in html_lower and len(html) < 5000)
                         )
-                    return ScrapeResult(
-                        url=url,
-                        success=False,
-                        error=f"HTTP Error: {response.status_code} {response.reason_phrase}"
-                    )
-                
-                html = response.text
-                
-                # Check for anti-bot indicators
-                html_lower = html.lower()
-                anti_bot_indicators = [
-                    len(html) < 1000,  # Very short HTML (likely error/blocked page)
-                    'captcha' in html_lower,
-                    ('robot' in html_lower and 'detected' in html_lower),
-                    'access denied' in html_lower,
-                    'blocked' in html_lower,
-                    ('cloudflare' in html_lower and 'checking' in html_lower),
-                    'please enable javascript' in html_lower,
-                    # For Amazon specifically - check for error pages
-                    ('amazon.com' in url.lower() and 'ap_error' in html_lower and len(html) < 5000),
-                    # Check if page mentions "login" but HTML is very short (likely redirect page)
-                    ('login' in html_lower and len(html) < 3000 and 'password' not in html_lower),
-                ]
-                
-                needs_browser = any(anti_bot_indicators)
-                
-                if needs_browser:
-                    print(f"Anti-bot protection detected for {url}, switching to browser...")
-                    browser_html = await scrape_with_browser(url)
-                    if browser_html and len(browser_html) > 500:
-                        # Check if browser got better results
-                        browser_lower = browser_html.lower()
-                        if len(browser_html) > len(html) * 2 or ('password' in browser_lower and 'password' not in html_lower):
-                            print(f"Browser got better results (length: {len(browser_html)} vs {len(html)})")
-                            html = browser_html
-                        else:
-                            print(f"Browser results similar, using HTTP result")
-                    else:
-                        print(f"Browser also failed, using HTTP result")
-                
-                # Detect authentication components
-                auth_component = detect_auth_components(html, url)
-                
+                        
+                        # If URL is not a login URL and no auth found, try Playwright to find login link
+                        if not auth_component.found and not is_login_url(url):
+                            needs_playwright = True
+                            print(f"No login form found on homepage, will use Playwright to find login link...")
+                        
+                        # If static method worked, no auth found, and no need for Playwright, return result
+                        if not needs_playwright:
+                            return ScrapeResult(
+                                url=url,
+                                success=True,
+                                authComponent=auth_component
+                            )
+            except httpx.TimeoutException:
+                needs_playwright = True  # Will try Playwright
+            except Exception as e:
+                needs_playwright = True  # Will try Playwright
+        
+        # If static method failed, detected issues, or needs to find login link, try Playwright
+        if needs_playwright or not static_success or (html and len(html) < 1000):
+            print(f"Trying Playwright for {url}...")
+            playwright_html = await scrape_with_playwright(url)
+            
+            if playwright_html and len(playwright_html) > 500:
+                auth_component = detect_auth_components(playwright_html, url)
                 return ScrapeResult(
                     url=url,
                     success=True,
                     authComponent=auth_component
                 )
-                
-            except httpx.TimeoutException:
-                # Timeout - try browser as fallback
-                print(f"HTTP request timeout for {url}, trying browser...")
-                html = await scrape_with_browser(url)
-                if html and len(html) > 500:
-                    auth_component = detect_auth_components(html, url)
-                    return ScrapeResult(
-                        url=url,
-                        success=True,
-                        authComponent=auth_component
-                    )
+            elif static_success and html:
+                # Playwright failed, but we have static HTML, return that
+                auth_component = detect_auth_components(html, url)
                 return ScrapeResult(
                     url=url,
-                    success=False,
-                    error="Request timeout"
+                    success=True,
+                    authComponent=auth_component
                 )
-            except Exception as e:
-                # Other HTTP errors - try browser as fallback
-                print(f"HTTP request error for {url}: {e}, trying browser...")
-                html = await scrape_with_browser(url)
-                if html and len(html) > 500:
-                    auth_component = detect_auth_components(html, url)
-                    return ScrapeResult(
-                        url=url,
-                        success=True,
-                        authComponent=auth_component
-                    )
-                return ScrapeResult(
-                    url=url,
-                    success=False,
-                    error=str(e) or "Unknown error occurred while scraping the website"
-                )
+        
+        # Both methods failed
+        if not static_success:
+            return ScrapeResult(
+                url=url,
+                success=False,
+                error="Both static HTTP and Playwright methods failed"
+            )
+        else:
+            # Static method succeeded but no auth found
+            auth_component = detect_auth_components(html, url)
+            return ScrapeResult(
+                url=url,
+                success=True,
+                authComponent=auth_component
+            )
     except httpx.TimeoutException:
         return ScrapeResult(
             url=url,
