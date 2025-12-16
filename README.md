@@ -2,6 +2,14 @@
 
 An AI-powered tool for automatically detecting login forms and authentication components in web pages.
 
+## Screenshots
+
+### Main Interface
+![Main Interface](images/main-interface.png)
+
+### Detection Results
+![Detection Results](images/detection-results.png)
+
 ## Features
 
 - ✅ **Web Scraping**: Automatically scrapes website HTML content using static HTTP (fast) or Playwright (for JavaScript-rendered content)
