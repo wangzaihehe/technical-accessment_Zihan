@@ -13,7 +13,12 @@ app = FastAPI(title="Website Authentication Component Detector API")
 # Enable CORS for React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # Vite default port
+    allow_origins=[
+        "http://localhost:5173",  # Vite dev server
+        "http://localhost:3000",  # Alternative dev port
+        "http://localhost",       # Docker nginx
+        "http://localhost:80",     # Docker nginx (explicit port)
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

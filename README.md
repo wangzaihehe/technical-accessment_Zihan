@@ -78,6 +78,27 @@ npm run dev
 - Frontend: http://localhost:5173
 - Backend API: http://localhost:8000
 
+**Option 3: Docker Deployment (Recommended for Production)**
+
+```bash
+# Build and start all services
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# Stop services
+docker-compose down
+
+# Rebuild after code changes
+docker-compose up -d --build
+```
+
+Access the application:
+- Frontend: http://localhost:5003
+- Backend API: http://localhost:9000
+- API Documentation: http://localhost:9000/docs
+
 ## Usage
 
 1. **Single URL Detection**: Enter any website URL and click "Detect"
